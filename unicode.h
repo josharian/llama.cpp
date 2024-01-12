@@ -452,6 +452,13 @@ static std::unordered_map<std::string, uint8_t> unicode_to_bytes_map_bpe() {
             ++n;
         }
     }
+    // add characters that appear in the deepseek-code token <｜fim▁hole｜>
+    // the values 160, 173 was chosen because they doesn't conflict with any other byte above
+
+    // add unicode ｜ (Fullwidth Vertical Line)
+    map[codepoint_to_utf8(u'\uFF5C')] = 173;
+    // add unicode ▁ (Lower One Eighth Block)
+    map[codepoint_to_utf8(u'\u2581')] = 160;
     return map;
 }
 
