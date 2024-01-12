@@ -696,6 +696,12 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.input_suffix = argv[i];
+        } else if (arg == "--fuzzy") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            sparams.fuzzy_matcher = argv[i];
         } else if (arg == "--grammar") {
             if (++i >= argc) {
                 invalid_param = true;

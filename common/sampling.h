@@ -28,6 +28,8 @@ typedef struct llama_sampling_params {
     bool        penalize_nl           = true;     // consider newlines as a repeatable token
     std::string samplers_sequence     = "kfypmt"; // top_k, tail_free, typical_p, top_p, min_p, temp
 
+    std::string fuzzy_matcher; // optional fuzzy matcher to constrain sampling
+    // TODO: add fuzzy_matched logit bias to params
     std::string grammar;  // optional BNF-like grammar to constrain sampling
 
     // Classifier-Free Guidance
@@ -51,6 +53,9 @@ struct llama_sampling_context {
     float mirostat_mu;
 
     llama_grammar * grammar;
+    std::string fuzzy_matcher;
+    size_t fuzzy_matcher_orig_size; // size of the fuzzy matcher before matching any tokens
+    float fuzzy_urgency;
 
     // internal
     grammar_parser::parse_state parsed_grammar;

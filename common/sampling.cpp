@@ -1,10 +1,16 @@
 #include "sampling.h"
+#include <string>
+#include <cctype>
+#include <algorithm>
 
 struct llama_sampling_context * llama_sampling_init(const struct llama_sampling_params & params) {
     struct llama_sampling_context * result = new llama_sampling_context();
 
     result->params  = params;
     result->grammar = nullptr;
+    result->fuzzy_matcher = params.fuzzy_matcher; // TODO: ensure ascii, or deal with utf-8
+    result->fuzzy_matcher_orig_size = params.fuzzy_matcher.length();
+    result->fuzzy_urgency = 1;
 
     // if there is a grammar, parse it
     if (!params.grammar.empty()) {
@@ -91,10 +97,10 @@ std::string llama_sampling_print(const llama_sampling_params & params) {
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
             "\ttop_k = %d, tfs_z = %.3f, top_p = %.3f, min_p = %.3f, typical_p = %.3f, temp = %.3f\n"
-            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f",
+            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, fuzzy_matcher = \"%s\"\n",
             params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present,
             params.top_k, params.tfs_z, params.top_p, params.min_p, params.typical_p, params.temp,
-            params.mirostat, params.mirostat_eta, params.mirostat_tau);
+            params.mirostat, params.mirostat_eta, params.mirostat_tau, params.fuzzy_matcher.c_str());
 
     return std::string(result);
 }
@@ -149,6 +155,99 @@ static void sampler_queue(
     }
 }
 
+
+const float InitialMatchScore = 3.5;
+const float InnerMatchScore = 1.5;
+
+static std::string toLower(const std::string& str) {
+    std::string lowerCaseStr = str;
+    std::transform(lowerCaseStr.begin(), lowerCaseStr.end(), lowerCaseStr.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return lowerCaseStr;
+}
+
+static std::string trim(const std::string& str) {
+    auto start = str.find_first_not_of(" \t\n\r\f\v");
+    auto end = str.find_last_not_of(" \t\n\r\f\v");
+    return start == std::string::npos ? "" : str.substr(start, end - start + 1);
+}
+
+static float score(const std::string& match, const std::string& input) {
+    float n = 0;
+    std::string matchLower = toLower(trim(match));
+    std::string inputLower = toLower(trim(input));
+
+    if (matchLower.empty() || inputLower.empty()) {
+        return n;
+    }
+
+    if (matchLower[0] == inputLower[0]) {
+        n += InitialMatchScore;
+        matchLower = matchLower.substr(1);
+        inputLower = inputLower.substr(1);
+    }
+
+    for (size_t i = 0; i < matchLower.size(); ++i) {
+        if (inputLower.empty()) {
+            break; // no more possible matches
+        }
+        char want = matchLower[i];
+        auto found = false;
+        for (size_t j = 0; j < inputLower.size(); ++j) {
+            char got = inputLower[j];
+            if (got == want) {
+                n += InnerMatchScore;
+                inputLower = inputLower.substr(j+1); // the match consumes all inputs considered up to this point
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    return n;
+}
+
+static std::string unconsumed(const std::string& match, const std::string& input) {
+    std::string matchLower = toLower(trim(match));
+    std::string inputLower = toLower(trim(input));
+
+    if (matchLower.empty() || inputLower.empty()) {
+        return match;
+    }
+
+    size_t i = 0;
+    for (i = 0; i < matchLower.size(); ++i) {
+        if (inputLower.empty()) {
+            break; // no more possible matches
+        }
+        char want = matchLower[i];
+        auto found = false;
+        for (size_t j = 0; j < inputLower.size(); ++j) {
+            char got = inputLower[j];
+            if (got == want) {
+                inputLower = inputLower.substr(j+1); // the match consumes all inputs considered up to this point
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    return matchLower.substr(i);
+}
+
+static bool contains_letters(const std::string& str) {
+    for (auto c : str) {
+        if (std::isalpha(c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static llama_token llama_sampling_sample_impl(
                   struct llama_sampling_context * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -200,6 +299,30 @@ static llama_token llama_sampling_sample_impl(
 
     if (ctx_cfg) {
         llama_sample_classifier_free_guidance(ctx_main, &cur_p, ctx_cfg, params.cfg_scale);
+    }
+
+    // use fuzzy matcher to weight logits
+    if (!ctx_sampling->fuzzy_matcher.empty() && ctx_sampling->fuzzy_urgency > 0) {
+        std::string match = ctx_sampling->fuzzy_matcher;
+        // printf("\nTRYING TO MATCH %s\n", match.c_str());
+        for (llama_token tokid = 0; tokid < n_vocab; tokid++) {
+            std::string piece = llama_token_to_piece(ctx_main, tokid);
+            if (piece.empty() || piece[0] == 0) {
+                continue;
+            }
+            float score = ::score(match, piece);
+            cur_p.data[tokid].logit += /* params.temp * */ score * ctx_sampling->fuzzy_urgency;
+        }
+    }
+
+    // if fuzzy_matcher is empty, but fuzzy_matcher_orig_size > 0, add a logit bias to eos,
+    // to encourage the model to stop generating tokens. we already matched the target string.
+    if (ctx_sampling->fuzzy_matcher_orig_size > 0) {
+        if (ctx_sampling->fuzzy_matcher.empty()) {
+            cur_p.data[llama_token_eos(llama_get_model(ctx_main))].logit += 2 * ctx_sampling->fuzzy_urgency;
+        } else {
+            cur_p.data[llama_token_eos(llama_get_model(ctx_main))].logit = -INFINITY;
+        }
     }
 
     // apply penalties
@@ -309,5 +432,31 @@ void llama_sampling_accept(
 
     if (ctx_sampling->grammar != NULL && apply_grammar) {
         llama_grammar_accept_token(ctx_main, ctx_sampling->grammar, id);
+    }
+    if (ctx_sampling->fuzzy_matcher.size() > 0 && apply_grammar) {
+        std::string before = ctx_sampling->fuzzy_matcher;
+        std::string input = llama_token_to_piece(ctx_main, id);
+        std::string after = unconsumed(ctx_sampling->fuzzy_matcher, input);
+        ctx_sampling->fuzzy_matcher = after;
+        if (before != after) {
+            // found a match, reset urgency
+            ctx_sampling->fuzzy_urgency = 0;
+        } else {
+            // don't penalize for emitting punctuation
+            if (contains_letters(input)) {
+                // no match, increase urgency
+                if (ctx_sampling->fuzzy_urgency < 1) {
+                    ctx_sampling->fuzzy_urgency += 1;
+                } else {
+                    ctx_sampling->fuzzy_urgency *= 1.5;
+                }
+            }
+        }
+        // std::replace(input.begin(), input.end(), '\n', ' ');
+        // printf("\nfuzzy_matcher BEFORE='%s' INPUT='%s' AFTER='%s' urgency=%f\n", before.c_str(), input.c_str(), after.c_str(), ctx_sampling->fuzzy_urgency);
+    }
+    if (ctx_sampling->fuzzy_matcher_orig_size > 0 && ctx_sampling->fuzzy_matcher.empty() && apply_grammar) {
+        // we matched the target string, start increasing urgency to emit eos
+        ctx_sampling->fuzzy_urgency++;
     }
 }
